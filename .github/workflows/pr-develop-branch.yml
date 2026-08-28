@@ -18,12 +18,18 @@ on:
       paths:
         - 'force-app/**'
 
-# The default GITHUB_TOKEN permissions are read-only, except for
-# security-events, which we need in order to upload the code scanning
-# results to the "Security" tab of the repository.
+# The default GITHUB_TOKEN permissions are read-only. github/codeql-action
+# needs three scopes:
+#   contents: read         - to read the repo
+#   security-events: write - to publish the SARIF to the "Security" tab
+#   actions: read          - upload-sarif calls the "get a workflow run" REST
+#                            endpoint to work out which ref the results belong
+#                            to. Without it the step fails with
+#                            "Resource not accessible by integration".
 permissions:
     contents: read
     security-events: write
+    actions: read
 
 # Jobs to be executed when the above conditions are met
 jobs:
@@ -262,11 +268,13 @@ jobs:
             # results of the scan directly from the PR.
 
             # v4 categories ("Design,Best Practices,Performance") are now expressed as
-            # engine:tag rule selectors.
+            # engine:tag rule selectors. --rule-selector is an array flag, and passing
+            # one comma separated list is deprecated ("The input format for array
+            # arguments has changed"), so each selector gets its own flag.
             - name: 'Scan code'
               run: |
                   cd changed-sources
-                  sf code-analyzer run --workspace './**/*.cls' --rule-selector 'pmd:Design,pmd:BestPractices,pmd:Performance' --output-file 'apexScanResults.sarif'
+                  sf code-analyzer run --workspace './**/*.cls' --rule-selector pmd:Design --rule-selector pmd:BestPractices --rule-selector pmd:Performance --output-file 'apexScanResults.sarif'
                   cd ..
 
             # Now we upload the .sarif file as explained in the previous step
