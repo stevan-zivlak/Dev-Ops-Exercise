@@ -11,47 +11,128 @@ on:
       # The branches filter allows to specify that this workflow should only
       # run if the branch name is "develop". This way we prevent this workflow
       # from running when PRs are opened on other branches
-      branches: [ develop ]
+      branches: [ develop, uat ]
       # We only care about changes to the force-app directory, which is the
       # root directory of the sfdx project. This prevents the job from running
       # when changing non-salesforce files (like this yml file).
       paths:
         - 'force-app/**'
-            
+
+# The default GITHUB_TOKEN permissions are read-only. github/codeql-action
+# needs three scopes:
+#   contents: read         - to read the repo
+#   security-events: write - to publish the SARIF to the "Security" tab
+#   actions: read          - upload-sarif calls the "get a workflow run" REST
+#                            endpoint to work out which ref the results belong
+#                            to. Without it the step fails with
+#                            "Resource not accessible by integration".
+permissions:
+    contents: read
+    security-events: write
+    actions: read
 
 # Jobs to be executed when the above conditions are met
 jobs:
     # This is the name of the job. You can give it whatever name you want
     validate-deployment-on-develop-org:
         # As mentioned in the blog post, this job runs inside a VM. Here we
-        # can specify which OS this VM should run on. 
+        # can specify which OS this VM should run on.
         # In this case, we are going to run our commands on the latest version
         # of ubuntu
         runs-on: ubuntu-latest
         if: ${{ github.actor != 'dependabot[bot]' }}
-        steps:
-            # Now we install nodejs in the VM, and specify version 14
-            - uses: actions/setup-node@v3
-              with:
-                node-version: '14'
 
+        # SFDX_INTEGRATION_URL lives in the 'dev' GitHub Environment, not in
+        # repository secrets. Environment secrets are only injected into jobs that
+        # opt in to that environment, so without this line
+        # ${{ secrets.SFDX_INTEGRATION_URL }} resolves to an empty string and the
+        # auth step fails with an unhelpful error.
+        #
+        # Referencing an environment also subjects this job to that environment's
+        # protection rules (required reviewers, wait timer, deployment branch
+        # policy), so 'dev' should be left unprotected if you want PR validation
+        # to run unattended.
+        environment: dev
+
+        steps:
             # The idea is that the VM can access your remote repository
             # because your repository is an sfdx project.
-            # This is a default action that allows us to enter the root 
+            # This is a default action that allows us to enter the root
             # directory of the repository
 
             # Make sure to specify fetch-depth:0. This allows us to
             # access previous commits that have been pushed to the repository.
 
-            # We'll need this later when we try to figure out which metadata has 
+            # We'll need this later when we try to figure out which metadata has
             # changed between commits, so that we can only deploy that metadata
             # to the destination org
 
             - name: 'Checkout source code'
-              uses: actions/checkout@v3
+              uses: actions/checkout@v7
               with:
                 fetch-depth: 0
-            
+
+            # On a pull_request event, actions/checkout checks out the merge ref
+            # (refs/pull/<n>/merge). The first parent of that commit is the tip of
+            # the base branch, and the commit itself already contains every commit in
+            # the PR, so HEAD^..HEAD is exactly the change set this PR introduces.
+            #
+            # We resolve both SHAs once here and reuse them in the delta step, so the
+            # range printed in the log is guaranteed to be the range that was diffed.
+            - name: 'Resolve the commit range being validated'
+              env:
+                # Branch names are attacker-controlled on fork PRs, so PR metadata
+                # goes through env vars rather than ${{ }} interpolation.
+                PR_NUMBER: ${{ github.event.pull_request.number }}
+                BASE_REF: ${{ github.event.pull_request.base.ref }}
+                HEAD_REF: ${{ github.event.pull_request.head.ref }}
+                HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+              run: |
+                  DELTA_FROM=$(git rev-parse HEAD^)
+                  DELTA_TO=$(git rev-parse HEAD)
+                  echo "DELTA_FROM=$DELTA_FROM" >> $GITHUB_ENV
+                  echo "DELTA_TO=$DELTA_TO" >> $GITHUB_ENV
+
+                  # A bare backtick inside a double-quoted string is command
+                  # substitution, so the markdown code-span delimiter is held in a
+                  # single-quoted variable that the shell will never try to run.
+                  BT='`'
+
+                  # tee sends the same text to the step log and to the run summary,
+                  # which GitHub renders at the top of the workflow run page.
+                  {
+                    echo "## Validating PR #${PR_NUMBER}: ${BT}${HEAD_REF}${BT} into ${BT}${BASE_REF}${BT}"
+                    echo
+                    echo "|  | Ref | Commit |"
+                    echo "|---|---|---|"
+                    echo "| **From** (base branch tip) | ${BT}${BASE_REF}${BT} | ${BT}${DELTA_FROM}${BT} |"
+                    echo "| **To** (PR head) | ${BT}${HEAD_REF}${BT} | ${BT}${HEAD_SHA}${BT} |"
+                    echo
+                    echo "Delta diffed over ${BT}${DELTA_FROM}..${DELTA_TO}${BT}, where ${DELTA_TO} is the PR merge commit."
+                    echo
+                    echo "### Commits in this PR"
+                    echo
+                    echo '```'
+                    git log --oneline --no-decorate "$DELTA_FROM..$DELTA_TO"
+                    echo '```'
+                  } | tee -a "$GITHUB_STEP_SUMMARY"
+            # Now we install nodejs in the VM. Node 22 is the minimum supported
+            # by both the Salesforce CLI and the sfdx-git-delta plugin, whose
+            # dependencies now require Node >= 20.17 / 22.13.
+            - name: 'Install Node.js'
+              uses: actions/setup-node@v7
+              with:
+                node-version: '22'
+
+            # Java is required by the PMD engine of Salesforce Code Analyzer.
+            # Using setup-java is faster and more predictable than apt-get, and
+            # it pins the JDK version instead of taking whatever ubuntu ships.
+            - name: 'Install Java'
+              uses: actions/setup-java@v6
+              with:
+                distribution: 'temurin'
+                java-version: '21'
+
             # Now, we need a way to let the developer specify which tests to run, which
             # could be all tests or just the tests relevant to their deployment.
 
@@ -61,8 +142,8 @@ jobs:
             # Apex::[CommunitiesLoginControllerTest,MyProfilePageControllerTest]::Apex
             # or Apex::[all]::Apex to run all tests
 
-            # This special delimeter can be added to the PR template so that your 
-            # team doesn't have to remember the syntax. 
+            # This special delimeter can be added to the PR template so that your
+            # team doesn't have to remember the syntax.
 
             # Once a developer has specified a list of classes to run, we need to be able
             # to extract this information from the PR, and pass it on the the VM.
@@ -70,8 +151,10 @@ jobs:
             - name: 'Read PR Body'
               env:
                 # The pull request body is available through the github context object
-                # we put the body of the pull request in an env variable (only available to this step)
-                PR_BODY: ${{github.event.pull_request.body}}
+                # we put the body of the pull request in an env variable (only available to this step).
+                # Note that the body is attacker-controlled, so it is only ever referenced
+                # as a quoted shell variable, never interpolated into the script with ${{ }}
+                PR_BODY: ${{ github.event.pull_request.body }}
 
               # Here we print the content of the environment variable and
               # pipe to a a text file.
@@ -84,85 +167,119 @@ jobs:
               # as this allows us to reference the list in a subsequent step.  If you
               # were using a normal env variable, its value would not be available outside this step.
               run: |
-                  echo $PR_BODY > ./pr_body.txt
-                  node ./parsePR.js              
-                  TESTS=$(cat testsToRun.txt)       
+                  echo "$PR_BODY" > ./pr_body.txt
+                  node ./parsePR.js
+                  TESTS=$(cat testsToRun.txt)
                   echo "APEX_TESTS=$TESTS" >> $GITHUB_ENV
-                  
-            # Now Install Salesforce CLI
+
+            # Now Install the Salesforce CLI. The standalone tarball installer
+            # (sfdx-linux-x64.tar.xz) is deprecated, and it bundles its own old
+            # Node runtime, which is what broke the plugin installs below. The
+            # npm package uses the Node version we installed above instead.
             - name: 'Install Salesforce CLI'
               run: |
-                  wget https://developer.salesforce.com/media/salesforce-cli/sfdx/channels/stable/sfdx-linux-x64.tar.xz
-                  mkdir ~/sfdx
-                  tar xJf sfdx-linux-x64.tar.xz -C ~/sfdx --strip-components 1
-                  echo "$HOME/sfdx/bin" >> $GITHUB_PATH
-                  ~/sfdx/bin/sfdx version
+                  npm install --global @salesforce/cli@latest
+                  node --version
+                  sf --version
 
             # Then we install the SFDX-Git-Delta plugin - https://github.com/scolladon/sfdx-git-delta
             # This is an awesome plugin that allows us to extract a package.xml with the metadata
-            # that has changed between commits. I highly recommend going over the github readme 
+            # that has changed between commits. I highly recommend going over the github readme
             # for more information on how this works.
 
             - name: 'Installing sfdx git delta'
-              run: | 
-                  echo y | sfdx plugins:install sfdx-git-delta
-                  sfdx plugins 
-
-            # Install java as it is required for the next step
-            - name: 'Installing java'
               run: |
-                sudo apt-get update
-                sudo apt install default-jdk
+                  echo y | sf plugins install sfdx-git-delta@latest
+                  sf plugins
 
-            # Install SFDX scanner
-            - name: 'Installing SFDX scanner'
-              run: sfdx plugins:install @salesforce/sfdx-scanner
+            # Install Salesforce Code Analyzer. This replaces @salesforce/sfdx-scanner,
+            # which reached end of support - v5 ships as the "code-analyzer" plugin
+            # and exposes the `sf code-analyzer run` command.
+            - name: 'Installing Salesforce Code Analyzer'
+              run: sf plugins install code-analyzer@latest
 
             # Prior to setting up this workflow, you have to create a Github Secret
             # that contains the sfdx url of the integration/qa org.
 
-            # The steps to generate the url are here 
+            # The steps to generate the url are here
             # https://developer.salesforce.com/docs/atlas.en-us.sfdx_cli_reference.meta/sfdx_cli_reference/cli_reference_auth_sfdxurl.htm
 
-            # This URL can then be used with the sfdx auth:sfdxurl:store to authenticate
+            # This URL can then be used with `sf org login sfdx-url` to authenticate
             # the sfdx project in the repositry, against the org from which the URL
             # was generated from. This works just like that, there's no need to create
-            # connected apps or any else. 
+            # connected apps or any else.
 
             # The URL is stored in the Github Secret named SFDX_INTEGRATION_URL
             # so here we store the URL into a text file
             - name: 'Populate auth file with SFDX_URL secret of integration org'
               shell: bash
+              env:
+                SFDX_INTEGRATION_URL: ${{ secrets.SFDX_INTEGRATION_URL }}
               run: |
-                  echo ${{ secrets.SFDX_INTEGRATION_URL}} > ./SFDX_INTEGRATION_URL.txt
+                  echo "$SFDX_INTEGRATION_URL" > ./SFDX_INTEGRATION_URL.txt
 
             # Authenticate to org using the URL stored in the text file
             - name: 'Authenticate to Integration Org'
-              run: sfdx auth:sfdxurl:store -f ./SFDX_INTEGRATION_URL.txt -s -a integration
+              run: sf org login sfdx-url --sfdx-url-file ./SFDX_INTEGRATION_URL.txt --set-default --alias integration
 
             # We use SFDX Git Delta to create a directory with only the metadata that has changed.
-            # this allows us to deploy only those changes, as opposed to deploying the entire branch. 
+            # this allows us to deploy only those changes, as opposed to deploying the entire branch.
             # This helps reducing deployment times
+
+            # Note the v6 flag names: --output became --output-dir and --source became --source-dir
             - name: 'Create delta packages for new, modified or deleted metadata'
-              run: | 
+              run: |
                   mkdir changed-sources
-                  sfdx sgd:source:delta --to "HEAD" --from "HEAD^" --output changed-sources/ --generate-delta --source force-app/ 
+                  sf sgd source delta --to "$DELTA_TO" --from "$DELTA_FROM" --output-dir changed-sources/ --generate-delta --source-dir force-app/
 
-            # Now we can use the sfdx scanner to scan the code in the delta directory
+            # Print exactly what the delta contains, to both the step log and the run
+            # summary, so a reviewer can see what this PR would deploy without having
+            # to read through the deploy output. Every lookup is guarded so a PR with
+            # no additions (or no deletions) reports 'none' instead of failing.
+            - name: 'List the metadata being deployed'
+              run: |
+                  {
+                    echo "## Metadata in this deployment"
+                    echo
+                    echo "### Files to deploy ($(find changed-sources/force-app -type f 2>/dev/null | wc -l))"
+                    echo
+                    echo '```'
+                    find changed-sources/force-app -type f 2>/dev/null | sed 's|^changed-sources/||' | sort || true
+                    echo '```'
+                    echo
+                    echo "### package.xml"
+                    echo
+                    echo '```xml'
+                    cat changed-sources/package/package.xml 2>/dev/null || echo '(not generated)'
+                    echo '```'
+                    echo
+                    echo "### destructiveChanges.xml"
+                    echo
+                    echo '```xml'
+                    cat changed-sources/destructiveChanges/destructiveChanges.xml 2>/dev/null || echo '(not generated)'
+                    echo '```'
+                  } | tee -a "$GITHUB_STEP_SUMMARY"
+
+            # Now we can use Code Analyzer to scan the code in the delta directory.
             # The output of the scan is stored in a file called apexScanResults.sarif
+            # (Code Analyzer picks the output format from the file extension).
 
-            # The .sarif file can later be uploaded to github, so that we can see the 
+            # The .sarif file can later be uploaded to github, so that we can see the
             # results of the scan directly from the PR.
 
+            # v4 categories ("Design,Best Practices,Performance") are now expressed as
+            # engine:tag rule selectors. --rule-selector is an array flag, and passing
+            # one comma separated list is deprecated ("The input format for array
+            # arguments has changed"), so each selector gets its own flag.
             - name: 'Scan code'
               run: |
                   cd changed-sources
-                  sfdx scanner:run --format sarif --target './**/*.cls' --category "Design,Best Practices,Performance" --outfile 'apexScanResults.sarif'  
+                  sf code-analyzer run --workspace './**/*.cls' --rule-selector pmd:Design --rule-selector pmd:BestPractices --rule-selector pmd:Performance --output-file 'apexScanResults.sarif'
                   cd ..
 
             # Now we upload the .sarif file as explained in the previous step
             - name: Upload SARIF file
-              uses: github/codeql-action/upload-sarif@v1
+              uses: github/codeql-action/upload-sarif@v4
               with:
                 sarif_file: changed-sources/apexScanResults.sarif
 
@@ -170,17 +287,33 @@ jobs:
             # If the env variable does not equal 'all', we know that there is a list of
             # tests that can be run
 
+            # `sf project deploy validate` is the replacement for
+            # `sfdx force:source:deploy --checkonly`. Unlike the old --runtests flag,
+            # --tests does not accept a comma separated list, so we expand the list
+            # coming out of parsePR.js into one --tests flag per class.
+
+            # --verbose replaces the old --json: it prints the per-component deploy
+            # table and the Apex test results as readable text, instead of a single
+            # JSON blob that nobody can scan in a log.
+
             - name: 'Check-only deploy delta changes - run specified tests'
               if: ${{ env.APEX_TESTS != 'all' }}
               run: |
-                  echo ${{env.APEX_TESTS}}
-                  sfdx force:source:deploy -p "changed-sources/force-app" --checkonly --testlevel RunSpecifiedTests --runtests ${{env.APEX_TESTS}} --json
+                  echo "Apex tests requested in the PR body: $APEX_TESTS"
+                  TEST_FLAGS=""
+                  for TEST_CLASS in $(echo "$APEX_TESTS" | tr ',' ' '); do
+                    TEST_FLAGS="$TEST_FLAGS --tests $TEST_CLASS"
+                  done
+                  sf project deploy validate --source-dir "changed-sources/force-app" --test-level RunSpecifiedTests $TEST_FLAGS --verbose
 
             # If the env variable equals all, we run all tests
             - name: 'Check-only deploy delta changes - run all tests'
               if: ${{ env.APEX_TESTS == 'all' }}
               run: |
-                  sfdx force:source:deploy -p "changed-sources/force-app" --checkonly --testlevel RunLocalTests  --json
+                  sf project deploy validate --source-dir "changed-sources/force-app" --test-level RunLocalTests --verbose
 
+            # The destructive changes are in metadata API format, and they are validated
+            # without running tests, so we use `deploy start --dry-run` rather than
+            # `deploy validate` (which requires a test level)
             - name: 'Deploy destructive changes (if any)'
-              run: sfdx force:mdapi:deploy -d "changed-sources/destructiveChanges" --checkonly --ignorewarnings 
+              run: sf project deploy start --metadata-dir "changed-sources/destructiveChanges" --dry-run --ignore-warnings --verbose
