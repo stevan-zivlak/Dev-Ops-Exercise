@@ -98,7 +98,7 @@ jobs:
                   sf sgd source delta --to "$DELTA_TO" --from "$DELTA_FROM" --output-dir changed-sources/ --generate-delta --source-dir force-app/
 
             - name: 'Deploy the entire branch to Dev org'
-              run: sf project deploy start --source-dir force-app --test-level RunLocalTests --wait 60 --verbose
+              run: sf project deploy start --source-dir "changed-sources/force-app" --test-level RunLocalTests --wait 60 --verbose
 
             # --dry-run validates the deletions without applying them, which is
             # what --checkonly did here before. Drop it to actually delete.
