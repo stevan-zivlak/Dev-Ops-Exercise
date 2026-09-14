@@ -1,69 +1,106 @@
-# Unique name for this workflow
-name: Deploy integration branch to integration and staging/uat orgs
+name: Deploy develop branch to dev org
 
-# Definition when the workflow should run
 on:
     push:
-      branches: [ integration ]
+      branches: [ develop ]
       paths:
         - 'force-app/**'
-            
 
-# Jobs to be executed
+permissions:
+    contents: read
+
 jobs:
-    deploy-branch-to-int-and-staging-orgs:
+    deploy-develop-branch-to-dev-org:
         runs-on: ubuntu-latest
         if: ${{ github.actor != 'dependabot[bot]' }}
+
+        # SFDX_INTEGRATION_URL is a secret of the 'dev' environment, and those
+        # are only injected into jobs that opt in to the environment.
+        environment: dev
+
         steps:
-            # Install Salesforce CLI
-            - name: 'Install Salesforce CLI'
-              run: |
-                  wget https://developer.salesforce.com/media/salesforce-cli/sfdx/channels/stable/sfdx-linux-x64.tar.xz
-                  mkdir ~/sfdx
-                  tar xJf sfdx-linux-x64.tar.xz -C ~/sfdx --strip-components 1
-                  echo "$HOME/sfdx/bin" >> $GITHUB_PATH
-                  ~/sfdx/bin/sfdx version
-
-            # install SFDX-Git-Delta plugin - https://github.com/scolladon/sfdx-git-delta
-            - name: 'Installing sfdx git delta'
-              run: | 
-                  echo y | sfdx plugins:install sfdx-git-delta
-                  sfdx plugins 
-
-            # Checkout the source code
+            # fetch-depth: 0 gives sfdx-git-delta the history it needs to diff
+            # this push against the previous state of the branch.
             - name: 'Checkout source code'
-              uses: actions/checkout@v3
+              uses: actions/checkout@v7
               with:
                 fetch-depth: 0
 
-            # Store secret for both otgs
-            - name: 'Populate auth file with SFDX_URL secret of the integration and staging orgs'
-              shell: bash
+            # github.event.before is the SHA the branch pointed at before this
+            # push. It is all zeroes when the branch is created, and it can name
+            # a commit that no longer exists after a force push, hence the
+            # fallback to the previous commit.
+            - name: 'Resolve the commit range being deployed'
+              env:
+                EVENT_BEFORE: ${{ github.event.before }}
               run: |
-                  echo ${{ secrets.SFDX_INTEGRATION_URL}} > ./SFDX_INTEGRATION_URL.txt
-                  echo ${{ secrets.SFDX_STAGING_URL}} > ./SFDX_STAGING_URL.txt
+                  if git cat-file -e "${EVENT_BEFORE}^{commit}" 2>/dev/null; then
+                    DELTA_FROM="$EVENT_BEFORE"
+                  else
+                    echo "::notice::${EVENT_BEFORE} is not a reachable commit (new branch or force push); falling back to HEAD^"
+                    DELTA_FROM=$(git rev-parse HEAD^)
+                  fi
+                  DELTA_TO=$(git rev-parse HEAD)
+                  echo "DELTA_FROM=$DELTA_FROM" >> $GITHUB_ENV
+                  echo "DELTA_TO=$DELTA_TO" >> $GITHUB_ENV
 
+                  # A bare backtick inside a double-quoted string is command
+                  # substitution, so the markdown code-span delimiter is held in
+                  # a single-quoted variable.
+                  BT='`'
+
+                  {
+                    echo "## Deploying ${BT}${GITHUB_REF_NAME}${BT} to the dev org"
+                    echo
+                    echo "Destructive changes computed over ${BT}${DELTA_FROM}..${DELTA_TO}${BT}."
+                    echo
+                    echo "### Commits in this push"
+                    echo
+                    echo '```'
+                    git log --oneline --no-decorate "$DELTA_FROM..$DELTA_TO"
+                    echo '```'
+                  } | tee -a "$GITHUB_STEP_SUMMARY"
+
+            # Node 22 is the minimum supported by both the Salesforce CLI and
+            # the sfdx-git-delta plugin.
+            - name: 'Install Node.js'
+              uses: actions/setup-node@v7
+              with:
+                node-version: '22'
+
+            - name: 'Install Salesforce CLI'
+              run: |
+                  npm install --global @salesforce/cli@latest
+                  node --version
+                  sf --version
+
+            # https://github.com/scolladon/sfdx-git-delta
+            - name: 'Installing sfdx git delta'
+              run: |
+                  echo y | sf plugins install sfdx-git-delta@latest
+                  sf plugins
+
+            - name: 'Populate auth file with SFDX_URL secret of the dev org'
+              shell: bash
+              env:
+                SFDX_INTEGRATION_URL: ${{ secrets.SFDX_INTEGRATION_URL }}
+              run: |
+                  echo "$SFDX_INTEGRATION_URL" > ./SFDX_INTEGRATION_URL.txt
+
+            - name: 'Authenticate to Dev Org'
+              run: sf org login sfdx-url --sfdx-url-file ./SFDX_INTEGRATION_URL.txt --set-default --alias dev
+
+            # The whole of force-app is deployed below, so the delta is only
+            # used for the deletions, which have to come from the diff.
             - name: 'Create delta packages for new, modified or deleted metadata'
-              run: | 
+              run: |
                   mkdir changed-sources
-                  sfdx sgd:source:delta --to "HEAD" --from "HEAD^" --output changed-sources/ --generate-delta --source force-app/
+                  sf sgd source delta --to "$DELTA_TO" --from "$DELTA_FROM" --output-dir changed-sources/ --generate-delta --source-dir force-app/
 
-            # Authenticate to org
-            - name: 'Authenticate to Integration Org'
-              run: sfdx auth:sfdxurl:store -f ./SFDX_INTEGRATION_URL.txt -s -a integration
+            - name: 'Deploy the entire branch to Dev org'
+              run: sf project deploy start --source-dir force-app --test-level RunLocalTests --wait 60 --verbose
 
-            - name: 'Deploy the entire branch to Integration org'
-              run: sfdx force:source:deploy -p force-app --testlevel RunLocalTests --json
-
-            - name: 'Deploy destructive changes (if any) to Integration org'
-              run: sfdx force:mdapi:deploy -d "changed-sources/destructiveChanges" --checkonly --ignorewarnings 
-
-            # Authenticate to org
-            - name: 'Authenticate to Staging Org to Staging org'
-              run: sfdx auth:sfdxurl:store -f ./SFDX_STAGING_URL.txt -s -a staging
-
-            - name: 'Deploy the entire branch'
-              run: sfdx force:source:deploy -p force-app --testlevel RunLocalTests --json
-
-            - name: 'Deploy destructive changes (if any) to Staging org'
-              run: sfdx force:mdapi:deploy -d "changed-sources/destructiveChanges" --checkonly --ignorewarnings
+            # --dry-run validates the deletions without applying them, which is
+            # what --checkonly did here before. Drop it to actually delete.
+            - name: 'Deploy destructive changes (if any) to Dev org'
+              run: sf project deploy start --metadata-dir "changed-sources/destructiveChanges" --dry-run --ignore-warnings --verbose
