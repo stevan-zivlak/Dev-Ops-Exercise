@@ -1,8 +1,8 @@
-name: Deploy develop or uat branch to its org
+name: Deploy develop, UAT or master branch to its org
 
 on:
     push:
-      branches: [ develop, uat ]
+      branches: [ develop, uat, master ]
       paths:
         - 'force-app/**'
 
@@ -10,14 +10,14 @@ permissions:
     contents: read
 
 jobs:
-    deploy-develop-branch-to-dev-org:
+    deploy-branch-to-its-org:
         runs-on: ubuntu-latest
         if: ${{ github.actor != 'dependabot[bot]' }}
 
-        environment: ${{ github.ref_name == 'uat' && 'uat' || 'dev' }}
+        environment: ${{ github.ref_name == 'master' && 'main' || github.ref_name == 'uat' && 'uat' || 'dev' }}
 
         env:
-          TARGET_ORG: ${{ github.ref_name == 'uat' && 'uat' || 'dev' }}
+          TARGET_ORG: ${{ github.ref_name == 'master' && 'production' || github.ref_name == 'uat' && 'uat' || 'dev' }}
 
         steps:
             - name: 'Checkout source code'
