@@ -1,4 +1,4 @@
-name: Validate PR on develop branch
+name: Validate PR on develop or UAT branch
 
 on:
     pull_request:
@@ -17,7 +17,7 @@ jobs:
         runs-on: ubuntu-latest
         if: ${{ github.actor != 'dependabot[bot]' }}
 
-        environment: dev
+        environment: ${{ github.event.pull_request.base.ref == 'uat' && 'uat' || 'dev' }}
 
         steps:
             - name: 'Checkout source code'

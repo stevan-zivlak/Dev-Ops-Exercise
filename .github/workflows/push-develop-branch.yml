@@ -1,8 +1,8 @@
-name: Deploy develop branch to dev org
+name: Deploy develop or uat branch to its org
 
 on:
     push:
-      branches: [ develop ]
+      branches: [ develop, uat ]
       paths:
         - 'force-app/**'
 
@@ -14,7 +14,10 @@ jobs:
         runs-on: ubuntu-latest
         if: ${{ github.actor != 'dependabot[bot]' }}
 
-        environment: dev
+        environment: ${{ github.ref_name == 'uat' && 'uat' || 'dev' }}
+
+        env:
+          TARGET_ORG: ${{ github.ref_name == 'uat' && 'uat' || 'dev' }}
 
         steps:
             - name: 'Checkout source code'
@@ -39,7 +42,7 @@ jobs:
                   BT='`'
 
                   {
-                    echo "## Deploying ${BT}${GITHUB_REF_NAME}${BT} to the dev org"
+                    echo "## Deploying ${BT}${GITHUB_REF_NAME}${BT} to the ${TARGET_ORG} org"
                     echo
                     echo "Destructive changes computed over ${BT}${DELTA_FROM}..${DELTA_TO}${BT}."
                     echo
@@ -66,23 +69,23 @@ jobs:
                   echo y | sf plugins install sfdx-git-delta@latest
                   sf plugins
 
-            - name: 'Populate auth file with SFDX_URL secret of the dev org'
+            - name: 'Populate auth file with SFDX_URL secret of the target org'
               shell: bash
               env:
                 SFDX_INTEGRATION_URL: ${{ secrets.SFDX_INTEGRATION_URL }}
               run: |
                   echo "$SFDX_INTEGRATION_URL" > ./SFDX_INTEGRATION_URL.txt
 
-            - name: 'Authenticate to Dev Org'
-              run: sf org login sfdx-url --sfdx-url-file ./SFDX_INTEGRATION_URL.txt --set-default --alias dev
+            - name: 'Authenticate to the target org'
+              run: sf org login sfdx-url --sfdx-url-file ./SFDX_INTEGRATION_URL.txt --set-default --alias "$TARGET_ORG"
 
             - name: 'Create delta packages for new, modified or deleted metadata'
               run: |
                   mkdir changed-sources
                   sf sgd source delta --to "$DELTA_TO" --from "$DELTA_FROM" --output-dir changed-sources/ --generate-delta --source-dir force-app/
 
-            - name: 'Deploy the entire branch to Dev org'
+            - name: 'Deploy the delta to the target org'
               run: sf project deploy start --source-dir "changed-sources/force-app" --test-level RunLocalTests --wait 60 --verbose
 
-            - name: 'Deploy destructive changes (if any) to Dev org'
+            - name: 'Deploy destructive changes (if any) to the target org'
               run: sf project deploy start --metadata-dir "changed-sources/destructiveChanges" --dry-run --ignore-warnings --verbose
