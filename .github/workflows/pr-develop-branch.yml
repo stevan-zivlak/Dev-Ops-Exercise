@@ -1,9 +1,9 @@
-name: Validate PR on develop or UAT branch
+name: Validate PR on develop, UAT or master branch
 
 on:
     pull_request:
       types: [opened, synchronize]
-      branches: [ develop, uat ]
+      branches: [ develop, uat, master ]
       paths:
         - 'force-app/**'
 
@@ -17,7 +17,7 @@ jobs:
         runs-on: ubuntu-latest
         if: ${{ github.actor != 'dependabot[bot]' }}
 
-        environment: ${{ github.event.pull_request.base.ref == 'uat' && 'uat' || 'dev' }}
+        environment: ${{ github.event.pull_request.base.ref == 'master' && 'main' || github.event.pull_request.base.ref == 'uat' && 'uat' || 'dev' }}
 
         steps:
             - name: 'Checkout source code'
