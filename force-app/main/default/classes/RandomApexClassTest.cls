@@ -1,5 +1,5 @@
 @isTest
-private class RandomApexClassTest { //.
+private class RandomApexClassTest { //final changes
 
     @isTest
     static void helloWorldTest() {

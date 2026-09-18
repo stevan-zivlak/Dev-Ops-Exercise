@@ -1,8 +1,8 @@
-name: Deploy develop branch to dev org
+name: Deploy develop or uat branch to its org
 
 on:
     push:
-      branches: [ develop ]
+      branches: [ develop, uat ]
       paths:
         - 'force-app/**'
 
@@ -14,22 +14,17 @@ jobs:
         runs-on: ubuntu-latest
         if: ${{ github.actor != 'dependabot[bot]' }}
 
-        # SFDX_INTEGRATION_URL is a secret of the 'dev' environment, and those
-        # are only injected into jobs that opt in to the environment.
-        environment: dev
+        environment: ${{ github.ref_name == 'uat' && 'uat' || 'dev' }}
+
+        env:
+          TARGET_ORG: ${{ github.ref_name == 'uat' && 'uat' || 'dev' }}
 
         steps:
-            # fetch-depth: 0 gives sfdx-git-delta the history it needs to diff
-            # this push against the previous state of the branch.
             - name: 'Checkout source code'
               uses: actions/checkout@v7
               with:
                 fetch-depth: 0
 
-            # github.event.before is the SHA the branch pointed at before this
-            # push. It is all zeroes when the branch is created, and it can name
-            # a commit that no longer exists after a force push, hence the
-            # fallback to the previous commit.
             - name: 'Resolve the commit range being deployed'
               env:
                 EVENT_BEFORE: ${{ github.event.before }}
@@ -44,13 +39,10 @@ jobs:
                   echo "DELTA_FROM=$DELTA_FROM" >> $GITHUB_ENV
                   echo "DELTA_TO=$DELTA_TO" >> $GITHUB_ENV
 
-                  # A bare backtick inside a double-quoted string is command
-                  # substitution, so the markdown code-span delimiter is held in
-                  # a single-quoted variable.
                   BT='`'
 
                   {
-                    echo "## Deploying ${BT}${GITHUB_REF_NAME}${BT} to the dev org"
+                    echo "## Deploying ${BT}${GITHUB_REF_NAME}${BT} to the ${TARGET_ORG} org"
                     echo
                     echo "Destructive changes computed over ${BT}${DELTA_FROM}..${DELTA_TO}${BT}."
                     echo
@@ -61,8 +53,6 @@ jobs:
                     echo '```'
                   } | tee -a "$GITHUB_STEP_SUMMARY"
 
-            # Node 22 is the minimum supported by both the Salesforce CLI and
-            # the sfdx-git-delta plugin.
             - name: 'Install Node.js'
               uses: actions/setup-node@v7
               with:
@@ -74,33 +64,28 @@ jobs:
                   node --version
                   sf --version
 
-            # https://github.com/scolladon/sfdx-git-delta
             - name: 'Installing sfdx git delta'
               run: |
                   echo y | sf plugins install sfdx-git-delta@latest
                   sf plugins
 
-            - name: 'Populate auth file with SFDX_URL secret of the dev org'
+            - name: 'Populate auth file with SFDX_URL secret of the target org'
               shell: bash
               env:
                 SFDX_INTEGRATION_URL: ${{ secrets.SFDX_INTEGRATION_URL }}
               run: |
                   echo "$SFDX_INTEGRATION_URL" > ./SFDX_INTEGRATION_URL.txt
 
-            - name: 'Authenticate to Dev Org'
-              run: sf org login sfdx-url --sfdx-url-file ./SFDX_INTEGRATION_URL.txt --set-default --alias dev
+            - name: 'Authenticate to the target org'
+              run: sf org login sfdx-url --sfdx-url-file ./SFDX_INTEGRATION_URL.txt --set-default --alias "$TARGET_ORG"
 
-            # The whole of force-app is deployed below, so the delta is only
-            # used for the deletions, which have to come from the diff.
             - name: 'Create delta packages for new, modified or deleted metadata'
               run: |
                   mkdir changed-sources
                   sf sgd source delta --to "$DELTA_TO" --from "$DELTA_FROM" --output-dir changed-sources/ --generate-delta --source-dir force-app/
 
-            - name: 'Deploy the entire branch to Dev org'
+            - name: 'Deploy the delta to the target org'
               run: sf project deploy start --source-dir "changed-sources/force-app" --test-level RunLocalTests --wait 60 --verbose
 
-            # --dry-run validates the deletions without applying them, which is
-            # what --checkonly did here before. Drop it to actually delete.
-            - name: 'Deploy destructive changes (if any) to Dev org'
+            - name: 'Deploy destructive changes (if any) to the target org'
               run: sf project deploy start --metadata-dir "changed-sources/destructiveChanges" --dry-run --ignore-warnings --verbose
